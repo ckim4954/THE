@@ -1,11 +1,9 @@
 
-name: Auto Detect, Repair and Build APK
+name: Auto Repair and Build Android APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
-  pull_request:
     branches: [main, master]
 
 permissions:
@@ -16,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-apk:
-    name: Auto Repair and Build Android APK
+  build:
+    name: Detect, Repair and Build APK
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -28,21 +26,19 @@ jobs:
 
     steps:
 
-      # 1. Download source repository
+      # 1. Download repository
       - name: Checkout Source
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
 
       # 2. Install Java
-      - name: Install Java JDK 17
+      - name: Install Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Detect source ZIP or existing Android project
-      - name: Auto Detect and Extract Source ZIP
+      # 3. Detect project or extract ZIP
+      - name: Detect and Extract Source
         id: source
         shell: bash
         run: |
@@ -51,80 +47,64 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"
           PROJECT=""
 
-          echo "Searching for Android project..."
+          echo "Searching existing Android project..."
 
-          if [ -f "$ROOT/settings.gradle.kts" ] || \
-             [ -f "$ROOT/settings.gradle" ]; then
-            PROJECT="$ROOT"
-          else
-            PROJECT=$(
-              find "$ROOT" \
-                -mindepth 2 -maxdepth 8 \
-                -type f \
-                \( -name settings.gradle.kts -o -name settings.gradle \) \
-                -not -path '*/.git/*' \
-                -not -path '*/_autobuild_source/*' \
-                -printf '%d %h\n' |
-              sort -n |
-              head -n 1 |
-              cut -d' ' -f2-
-            )
-          fi
+          PROJECT=$(find "$ROOT" \
+            -mindepth 1 -maxdepth 8 \
+            -type f \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            -not -path '*/.git/*' \
+            -not -path '*/_autobuild_source/*' \
+            -printf '%d %h\n' |
+            sort -n | head -n 1 | cut -d' ' -f2- || true)
 
           if [ -z "$PROJECT" ]; then
 
-            ZIP=$(
-              find "$ROOT" -type f -iname '*.zip' \
-                -not -path '*/.git/*' \
-                -not -path '*/_autobuild_source/*' \
-                -printf '%T@ %p\n' |
-              sort -nr |
-              head -n 1 |
-              cut -d' ' -f2-
-            )
+            echo "Searching ZIP source..."
+
+            ZIP=$(find "$ROOT" -type f -iname '*.zip' \
+              -not -path '*/.git/*' \
+              -not -path '*/_autobuild_source/*' \
+              -printf '%T@ %p\n' |
+              sort -nr | head -n 1 | cut -d' ' -f2- || true)
 
             if [ -z "$ZIP" ]; then
-              echo "::error::No Android source ZIP found!"
+              echo "::error::No Android project or source ZIP found!"
               exit 1
             fi
 
-            echo "Found ZIP: $ZIP"
+            echo "ZIP found: $ZIP"
 
             DEST="$ROOT/_autobuild_source"
             mkdir -p "$DEST"
-
             unzip -oq "$ZIP" -d "$DEST"
 
-            SETTINGS=$(
-              find "$DEST" -maxdepth 9 -type f \
-                \( -name settings.gradle.kts -o -name settings.gradle \) |
-              head -n 1
-            )
+            SETTINGS=$(find "$DEST" -maxdepth 9 -type f \
+              \( -name settings.gradle.kts -o -name settings.gradle \) |
+              head -n 1 || true)
 
             if [ -z "$SETTINGS" ]; then
               echo "::error::No Gradle project found inside ZIP!"
               exit 1
             fi
 
-            PROJECT="$(dirname "$SETTINGS")"
+            PROJECT=$(dirname "$SETTINGS")
           fi
 
           if [ ! -f "$PROJECT/gradlew" ]; then
-            echo "::error::Missing Gradle Wrapper!"
+            echo "::error::Gradle Wrapper missing!"
             exit 1
           fi
 
-          chmod +x "$PROJECT/gradlew"
-
-          echo "Detected project: $PROJECT"
+          echo "Project: $PROJECT"
           echo "project_dir=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      # 4. Gradle cache
-      - name: Setup Gradle Cache
+      # 4. Setup Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # 5. Find existing Android SDK Manager
-      - name: Prepare Android SDK Manager
+      # 5. Locate SDK Manager WITHOUT chmod
+      - name: Locate Android SDK Manager
         id: sdk
         shell: bash
         run: |
@@ -132,35 +112,42 @@ jobs:
 
           SDK="$ANDROID_HOME"
 
-          echo "Checking Android SDK: $SDK"
+          echo "Android SDK: $SDK"
 
           if [ ! -d "$SDK" ]; then
-            echo "::error::Android SDK directory not found!"
+            echo "::error::Android SDK not found!"
             exit 1
           fi
 
-          SDKMANAGER=$(
-            find "$SDK/cmdline-tools" \
+          SDKMANAGER=""
+
+          # Prefer the SDK Manager already installed on runner.
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER=$(command -v sdkmanager)
+          else
+            SDKMANAGER=$(find "$SDK/cmdline-tools" \
               -type f -name sdkmanager 2>/dev/null |
-            sort -V |
-            tail -n 1
-          )
+              sort -V | tail -n 1 || true)
+          fi
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found in installed Android SDK!"
+            echo "::error::SDK Manager not found!"
             exit 1
           fi
 
-          chmod +x "$SDKMANAGER"
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::SDK Manager is not executable!"
+            exit 1
+          fi
 
+          # IMPORTANT: Do not chmod preinstalled SDK files.
           echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
 
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "SDK Manager found: $SDKMANAGER"
 
-          echo "Found SDK Manager: $SDKMANAGER"
-
-      # 6. Detect and install missing Android SDK components
-      - name: Auto Install Missing Android SDK
+      # 6. Install only required missing SDK packages
+      - name: Install Missing SDK Components
+        id: packages
         working-directory: ${{ steps.source.outputs.project_dir }}
         shell: bash
         env:
@@ -168,36 +155,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Detecting compileSdk and buildToolsVersion..."
-
-          read -r COMPILE_SDK BUILD_TOOLS NDK_VERSION < <(
+          read -r COMPILE_SDK BUILD_TOOLS < <(
             python3 - <<'PY'
           import re
           import tomllib
           from pathlib import Path
 
+          files = list(Path(".").rglob("build.gradle")) + \
+                  list(Path(".").rglob("build.gradle.kts"))
+
+          files = [
+              p for p in files
+              if ".gradle" not in p.parts and "build" not in p.parts
+          ]
+
           compile_sdk = ""
           build_tools = ""
-          ndk_version = ""
 
-          for path in Path(".").rglob("*"):
-              if not path.is_file():
-                  continue
-
-              if path.suffix not in (".gradle", ".kts"):
-                  continue
-
-              if ".gradle" in path.parts or "build" in path.parts:
-                  continue
-
-              try:
-                  text = path.read_text(encoding="utf-8")
-              except Exception:
-                  continue
+          for p in files:
+              text = p.read_text(encoding="utf-8", errors="ignore")
 
               if not compile_sdk:
                   m = re.search(
-                      r'\bcompileSdk(?:Version)?\s*(?:=\s*|\(\s*)?(\d+)',
+                      r'\bcompileSdk(?:Version)?\s*(?:=\s*)?(\d+)',
                       text
                   )
                   if m:
@@ -211,63 +191,50 @@ jobs:
                   if m:
                       build_tools = m.group(1)
 
-              if not ndk_version:
-                  m = re.search(
-                      r'ndkVersion\s*(?:=\s*)?["\']([^"\']+)',
-                      text
-                  )
-                  if m:
-                      ndk_version = m.group(1)
-
-          catalog = Path("gradle/libs.versions.toml")
-
-          if catalog.exists() and not compile_sdk:
-              try:
+          if not compile_sdk:
+              catalog = Path("gradle/libs.versions.toml")
+              if catalog.exists():
                   data = tomllib.loads(
                       catalog.read_text(encoding="utf-8")
                   )
-                  versions = data.get("versions", {})
-
-                  for key, value in versions.items():
+                  for key, value in data.get("versions", {}).items():
                       if "compile" in key.lower() and "sdk" in key.lower():
                           compile_sdk = str(value)
                           break
-              except Exception:
-                  pass
 
-          print(
-              compile_sdk or "36",
-              build_tools or "AUTO",
-              ndk_version or "NONE"
-          )
+          print(compile_sdk or "36", build_tools or "AUTO")
           PY
           )
 
-          echo "compileSdk=$COMPILE_SDK"
-          echo "buildTools=$BUILD_TOOLS"
-          echo "NDK=$NDK_VERSION"
+          echo "Required compileSdk: $COMPILE_SDK"
+          echo "Required build tools: $BUILD_TOOLS"
 
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          # Accept licenses without changing SDK file permissions.
+          set +e
+          yes | "$SDKMANAGER" --licenses
+          LICENSE_RESULT=$?
+          set -e
 
-          # Install required platform and tools.
-          "$SDKMANAGER" --install \
-            "platform-tools" \
-            "platforms;android-${COMPILE_SDK}"
+          # Install the Android platform only if missing.
+          if [ ! -d "$ANDROID_HOME/platforms/android-$COMPILE_SDK" ]; then
+            "$SDKMANAGER" --install \
+              "platforms;android-$COMPILE_SDK"
+          else
+            echo "Android platform already installed."
+          fi
 
-          # Install explicitly requested Build Tools.
+          # Install explicitly requested Build Tools only.
           if [ "$BUILD_TOOLS" != "AUTO" ]; then
-            "$SDKMANAGER" --install "build-tools;$BUILD_TOOLS"
+            if [ ! -d "$ANDROID_HOME/build-tools/$BUILD_TOOLS" ]; then
+              "$SDKMANAGER" --install \
+                "build-tools;$BUILD_TOOLS"
+            fi
           fi
 
-          # Install NDK only if project requires it.
-          if [ "$NDK_VERSION" != "NONE" ]; then
-            "$SDKMANAGER" --install "ndk;$NDK_VERSION"
-          fi
+          echo "SDK components ready."
 
-          echo "Android SDK preparation completed."
-
-      # 7. Automatically repair KSP version catalog
-      - name: Auto Repair KSP Configuration
+      # 7. Repair KSP version catalog
+      - name: Repair KSP Version
         working-directory: ${{ steps.source.outputs.project_dir }}
         shell: bash
         run: |
@@ -276,7 +243,7 @@ jobs:
           FILE="gradle/libs.versions.toml"
 
           if [ ! -f "$FILE" ]; then
-            echo "No version catalog. Skipping KSP catalog repair."
+            echo "No version catalog. Skipping."
             exit 0
           fi
 
@@ -288,17 +255,10 @@ jobs:
           path = Path("gradle/libs.versions.toml")
           content = path.read_text(encoding="utf-8")
 
-          try:
-              data = tomllib.loads(content)
-          except Exception as e:
-              print("Cannot parse version catalog:", e)
-              raise SystemExit(0)
+          data = tomllib.loads(content)
 
           plugins = data.get("plugins", {})
           versions = data.get("versions", {})
-
-          version_key = None
-          direct_version = None
 
           for name, plugin in plugins.items():
               if not isinstance(plugin, dict):
@@ -309,20 +269,21 @@ jobs:
 
               version = plugin.get("version", {})
 
-              if isinstance(version, dict):
-                  version_key = version.get("ref")
-              elif isinstance(version, str):
-                  direct_version = version
+              if not isinstance(version, dict):
+                  print("KSP has a direct version. No automatic change.")
+                  break
 
-              break
+              key = version.get("ref")
 
-          if version_key:
-              current = str(versions.get(version_key, ""))
+              if not key or key not in versions:
+                  break
 
-              if current.startswith("2.3.5"):
+              current = str(versions[key])
+
+              if current == "2.3.5":
                   pattern = (
                       r'(?m)^(\s*' +
-                      re.escape(version_key) +
+                      re.escape(key) +
                       r'\s*=\s*")[^"]+(")'
                   )
 
@@ -334,22 +295,17 @@ jobs:
 
                   if count:
                       path.write_text(content, encoding="utf-8")
-                      print("KSP upgraded from 2.3.5 to 2.3.6")
-
-          elif direct_version:
-              if direct_version.startswith("2.3.5"):
-                  print(
-                      "KSP uses direct plugin version. "
-                      "Please inspect manually before changing it."
-                  )
+                      print("KSP upgraded to 2.3.6")
               else:
-                  print("KSP direct version:", direct_version)
+                  print("KSP version:", current)
+
+              break
           else:
-              print("KSP plugin alias not detected. Skipping.")
+              print("KSP plugin not found. No change.")
           PY
 
-      # 8. Verify Gradle environment
-      - name: Verify Gradle Environment
+      # 8. Verify environment
+      - name: Verify Build Environment
         working-directory: ${{ steps.source.outputs.project_dir }}
         shell: bash
         run: |
@@ -358,15 +314,15 @@ jobs:
           java -version
           ./gradlew --version
 
-      # 9. Build Android APK with automatic retry
-      - name: Build Android Debug APK
+      # 9. Build APK
+      - name: Build Debug APK
         id: build
         working-directory: ${{ steps.source.outputs.project_dir }}
         shell: bash
         run: |
           set -uo pipefail
 
-          echo "Starting APK build..."
+          echo "Starting build..."
 
           ./gradlew \
             --no-daemon \
@@ -376,13 +332,11 @@ jobs:
           RESULT=$?
 
           if [ "$RESULT" -ne 0 ]; then
-
-            echo "::warning::First build failed. Retrying..."
+            echo "::warning::Retrying build..."
 
             ./gradlew --stop || true
 
-            rm -rf .gradle
-            rm -rf app/build build
+            rm -rf .gradle app/build build
 
             ./gradlew \
               --no-daemon \
@@ -394,28 +348,23 @@ jobs:
           fi
 
           if [ "$RESULT" -ne 0 ]; then
-            echo "::error::Build failed after retry!"
+            echo "::error::Build failed after retry."
             exit 1
           fi
 
-          APK=$(
-            find app/build/outputs/apk \
-              -type f -name '*.apk' 2>/dev/null |
-            head -n 1
-          )
+          APK=$(find app/build/outputs/apk \
+            -type f -name '*.apk' | head -n 1)
 
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "::error::APK output not found!"
+          if [ -z "$APK" ]; then
+            echo "::error::APK not generated!"
             exit 1
           fi
 
-          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
-
-          echo "APK generated successfully:"
+          echo "APK generated:"
           ls -lh "$APK"
 
-      # 10. Upload APK artifact
-      - name: Upload Android APK
+      # 10. Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: 89-Fitness-Yoga-Debug-APK
@@ -424,17 +373,15 @@ jobs:
           compression-level: 0
           retention-days: 30
 
-      # 11. Build summary
+      # 11. Summary
       - name: Build Summary
         if: always()
         shell: bash
         run: |
-          echo "## Android APK Build Report" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Automatic source detection: Enabled" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Automatic ZIP extraction: Enabled" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Java: 17" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Android SDK: Existing runner SDK" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Missing SDK components: Auto install" >> "$GITHUB_STEP_SUMMARY"
-          echo "- KSP catalog repair: Enabled" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Android Build Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source ZIP detection: Enabled" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Java 17: Enabled" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Existing Android SDK: Reused" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SDK permission modification: Disabled" >> "$GITHUB_STEP_SUMMARY"
+          echo "- KSP repair: Conditional" >> "$GITHUB_STEP_SUMMARY"
           echo "- Build retry: Enabled" >> "$GITHUB_STEP_SUMMARY"
