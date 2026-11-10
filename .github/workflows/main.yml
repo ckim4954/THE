@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       project_dir:
-        description: "Tùy chọn: đường dẫn tương đối tới Android Project nếu repository có nhiều dự án"
+        description: "Android Project directory (để trống nếu tự nhận diện)"
         required: false
         type: string
         default: ""
@@ -27,7 +27,7 @@ jobs:
       - name: 1. Checkout source code
         uses: actions/checkout@v4
 
-      - name: 2. Set up JDK 17 (required by AGP 9.1.1)
+      - name: 2. Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -35,27 +35,15 @@ jobs:
 
       - name: 3. Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # IMPORTANT:
+          # Do not install the deprecated "tools" package.
+          packages: "platform-tools"
 
-      - name: 4. Install Android SDK components
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Accept Android SDK licenses required by Gradle/AGP.
-          # Disable pipefail only for this pipeline.
-          set +o pipefail
-          yes | sdkmanager --licenses
-          set -o pipefail
-
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
-
-      - name: 5. Configure Gradle caching
+      - name: 4. Configure Gradle caching
         uses: gradle/actions/setup-gradle@v4
 
-      - name: 6. Detect Android Project directory
+      - name: 5. Detect Android Project directory
         id: detect-project
         shell: bash
         env:
@@ -65,49 +53,41 @@ jobs:
 
           WORKSPACE="$GITHUB_WORKSPACE"
           EXTRACT_ROOT="$RUNNER_TEMP/android-zip-sources"
+
           mkdir -p "$EXTRACT_ROOT"
 
-          is_android_project() {
-            local dir="$1"
-
-            [[ -f "$dir/settings.gradle" || -f "$dir/settings.gradle.kts" ]] || return 1
-            [[ -f "$dir/build.gradle" || -f "$dir/build.gradle.kts" ]] || return 1
-            [[ -f "$dir/app/build.gradle" || -f "$dir/app/build.gradle.kts" ]] || return 1
-            [[ -f "$dir/gradlew" ]] || return 1
-            [[ -f "$dir/gradle/wrapper/gradle-wrapper.properties" ]] || return 1
-            [[ -f "$dir/gradle/wrapper/gradle-wrapper.jar" ]] || return 1
-
-            local settings_file
-            settings_file="$(find "$dir" -maxdepth 1 -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)"
-
-            grep -Eq 'include[[:space:]]*\([[:space:]]*["'\'']:?app["'\'']' "$settings_file" ||
-              grep -Eq 'include[[:space:]]+["'\'']:?app["'\'']' "$settings_file"
-          }
-
           find_projects() {
-            local search_root="$1"
-
-            python3 - "$search_root" <<'PY'
+            python3 - "$1" <<'PY'
           import os
           import sys
           import re
 
           base = os.path.abspath(sys.argv[1])
-          ignored = {".git", ".gradle", "build", "node_modules", ".idea"}
+          ignored = {
+              ".git", ".gradle", "build",
+              "node_modules", ".idea"
+          }
+
           found = []
 
           for current, dirs, files in os.walk(base):
               dirs[:] = [d for d in dirs if d not in ignored]
 
               settings = next(
-                  (f for f in ("settings.gradle.kts", "settings.gradle") if f in files),
+                  (f for f in (
+                      "settings.gradle.kts",
+                      "settings.gradle"
+                  ) if f in files),
                   None
               )
 
               if not settings:
                   continue
 
-              if not ({"build.gradle.kts", "build.gradle"} & set(files)):
+              if not (
+                  {"build.gradle.kts", "build.gradle"}
+                  & set(files)
+              ):
                   continue
 
               app_dir = os.path.join(current, "app")
@@ -116,148 +96,206 @@ jobs:
                   continue
 
               if not (
-                  os.path.isfile(os.path.join(app_dir, "build.gradle.kts"))
-                  or os.path.isfile(os.path.join(app_dir, "build.gradle"))
+                  os.path.isfile(os.path.join(
+                      app_dir, "build.gradle.kts"
+                  ))
+                  or os.path.isfile(os.path.join(
+                      app_dir, "build.gradle"
+                  ))
+              ):
+                  continue
+
+              if not os.path.isfile(
+                  os.path.join(current, "gradlew")
+              ):
+                  continue
+
+              if not os.path.isfile(
+                  os.path.join(
+                      current,
+                      "gradle/wrapper/gradle-wrapper.properties"
+                  )
+              ):
+                  continue
+
+              if not os.path.isfile(
+                  os.path.join(
+                      current,
+                      "gradle/wrapper/gradle-wrapper.jar"
+                  )
               ):
                   continue
 
               settings_path = os.path.join(current, settings)
 
-              try:
-                  with open(settings_path, encoding="utf-8") as f:
-                      content = f.read()
-              except Exception:
-                  continue
+              with open(
+                  settings_path, encoding="utf-8"
+              ) as f:
+                  content = f.read()
 
-              if not re.search(r'include\s*\(?\s*["\']:?app["\']', content):
-                  continue
+              if re.search(
+                  r'include\s*\(?\s*["\']:?app["\']',
+                  content
+              ):
+                  found.append(os.path.abspath(current))
 
-              found.append(os.path.abspath(current))
-
-          for item in sorted(set(found)):
-              print(item)
+          for project in sorted(set(found)):
+              print(project)
           PY
           }
 
-          candidates=()
-
           if [[ -n "${PROJECT_DIR_INPUT:-}" ]]; then
-            requested_dir="$(realpath -m "$WORKSPACE/$PROJECT_DIR_INPUT")"
 
-            case "$requested_dir" in
+            REQUESTED="$(realpath -m "$WORKSPACE/$PROJECT_DIR_INPUT")"
+
+            case "$REQUESTED" in
               "$WORKSPACE"/*) ;;
               *)
-                echo "::error::project_dir phải nằm bên trong repository."
+                echo "::error::Project directory must be inside repository."
                 exit 1
                 ;;
             esac
 
-            if ! is_android_project "$requested_dir"; then
-              echo "::error::Đường dẫn project_dir không phải Android Project hợp lệ hoặc thiếu Gradle Wrapper/app module."
+            mapfile -t CANDIDATES < <(
+              find_projects "$REQUESTED"
+            )
+
+            if [[ ! " ${CANDIDATES[*]} " =~ " $REQUESTED " ]]; then
+              echo "::error::Selected directory is not a valid Android Project."
               exit 1
             fi
 
-            candidates=("$requested_dir")
-            echo "Đã sử dụng project_dir do người dùng chỉ định: $requested_dir"
+            CANDIDATES=("$REQUESTED")
 
           else
-            mapfile -t candidates < <(find_projects "$WORKSPACE")
 
-            if (( ${#candidates[@]} == 0 )); then
-              echo "Không tìm thấy Android Project đã giải nén. Kiểm tra các file ZIP trong repository..."
+            mapfile -t CANDIDATES < <(
+              find_projects "$WORKSPACE"
+            )
 
-              mapfile -d '' zip_files < <(
+            if (( ${#CANDIDATES[@]} == 0 )); then
+
+              echo "No extracted Android Project found."
+              echo "Searching ZIP archives..."
+
+              mapfile -d '' ZIP_FILES < <(
                 find "$WORKSPACE" \
-                  -type d \( -name .git -o -name .gradle -o -name build -o -name node_modules \) -prune \
+                  -type d \( \
+                    -name .git -o \
+                    -name .gradle -o \
+                    -name build -o \
+                    -name node_modules \
+                  \) -prune \
                   -o -type f -iname '*.zip' -print0
               )
 
-              if (( ${#zip_files[@]} == 0 )); then
-                echo "::error::Không tìm thấy Android Project hoặc file ZIP chứa Android Project."
+              if (( ${#ZIP_FILES[@]} == 0 )); then
+                echo "::error::No Android Project or source ZIP found."
                 exit 1
               fi
 
-              python3 - "$EXTRACT_ROOT" "${zip_files[@]}" <<'PY'
+              python3 - "$EXTRACT_ROOT" "${ZIP_FILES[@]}" <<'PY'
           import os
           import sys
           import zipfile
 
-          extract_root = os.path.abspath(sys.argv[1])
-          os.makedirs(extract_root, exist_ok=True)
+          root = os.path.abspath(sys.argv[1])
+          os.makedirs(root, exist_ok=True)
 
-          for index, archive in enumerate(sys.argv[2:], start=1):
-              destination = os.path.join(extract_root, f"archive-{index}")
+          for index, archive in enumerate(
+              sys.argv[2:], start=1
+          ):
+              destination = os.path.join(
+                  root, f"archive-{index}"
+              )
+
               os.makedirs(destination, exist_ok=True)
 
               with zipfile.ZipFile(archive) as zf:
+
                   for member in zf.infolist():
                       target = os.path.abspath(
-                          os.path.join(destination, member.filename)
+                          os.path.join(
+                              destination,
+                              member.filename
+                          )
                       )
 
-                      if os.path.commonpath([destination, target]) != destination:
+                      if os.path.commonpath(
+                          [destination, target]
+                      ) != destination:
                           raise RuntimeError(
-                              f"ZIP chứa đường dẫn không an toàn: {archive}"
+                              f"Unsafe ZIP path: {archive}"
                           )
 
                   zf.extractall(destination)
 
-              print(f"Đã giải nén: {os.path.basename(archive)}")
+              print(
+                  "Extracted:",
+                  os.path.basename(archive)
+              )
           PY
 
-              mapfile -t candidates < <(find_projects "$EXTRACT_ROOT")
+              mapfile -t CANDIDATES < <(
+                find_projects "$EXTRACT_ROOT"
+              )
+
             fi
           fi
 
-          if (( ${#candidates[@]} == 0 )); then
-            echo "::error::Không tìm thấy Android Project hợp lệ."
+          if (( ${#CANDIDATES[@]} == 0 )); then
+            echo "::error::No valid Android Project detected."
             exit 1
           fi
 
-          if (( ${#candidates[@]} > 1 )); then
-            echo "::error::Tìm thấy nhiều Android Project. Không tự chọn ngẫu nhiên. Hãy chạy workflow_dispatch và nhập project_dir."
-            printf 'Project tìm thấy: %s\n' "${candidates[@]}"
+          if (( ${#CANDIDATES[@]} > 1 )); then
+            echo "::error::Multiple Android Projects detected. Select project_dir manually."
+            printf '%s\n' "${CANDIDATES[@]}"
             exit 1
           fi
 
-          PROJECT_DIR="${candidates[0]}"
+          PROJECT_DIR="${CANDIDATES[0]}"
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Đã xác định Android Project: $PROJECT_DIR"
+          echo "=================================="
+          echo "ANDROID PROJECT: $PROJECT_DIR"
+          echo "=================================="
 
-      - name: 7. Verify toolchain and project wrapper
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: 6. Verify Java and Gradle Wrapper
         shell: bash
         run: |
           set -euo pipefail
 
+          cd "$PROJECT_DIR"
+
           echo "=== Java ==="
           java -version
 
-          echo "=== Gradle Wrapper configuration ==="
-          grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties
+          echo "=== Gradle Wrapper ==="
+          grep '^distributionUrl=' \
+            gradle/wrapper/gradle-wrapper.properties
 
-          echo "=== Project files ==="
-          test -f settings.gradle.kts -o -f settings.gradle
-          test -f app/build.gradle.kts -o -f app/build.gradle
           test -f gradle/wrapper/gradle-wrapper.jar
           test -f gradlew
+          test -f app/build.gradle.kts
 
           chmod +x ./gradlew
 
           ./gradlew --version
 
-      - name: 8. Create the configured debug keystore if missing
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: 7. Create Debug Keystore if missing
         shell: bash
         run: |
           set -euo pipefail
 
+          cd "$PROJECT_DIR"
+
           KEYSTORE="$PWD/debug.keystore"
 
           if [[ ! -f "$KEYSTORE" ]]; then
-            echo "debug.keystore không có trong source. Tạo keystore Debug theo đúng cấu hình signing."
+
+            echo "Creating Android Debug Keystore..."
 
             keytool -genkeypair -v \
               -keystore "$KEYSTORE" \
@@ -269,24 +307,29 @@ jobs:
               -keysize 2048 \
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
+
           else
-            echo "Đã tìm thấy debug.keystore có sẵn. Giữ nguyên file hiện tại."
+
+            echo "Existing Debug Keystore preserved."
+
           fi
 
           test -s "$KEYSTORE"
 
-      - name: 9. Build Debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: 8. Build Debug APK
         shell: bash
         run: |
           set -euo pipefail
 
-          ./gradlew --no-daemon --stacktrace :app:assembleDebug
+          cd "$PROJECT_DIR"
 
-      - name: 10. Verify and collect generated APK files
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            :app:assembleDebug
+
+      - name: 9. Verify and collect APK files
         shell: bash
-        env:
-          PROJECT_DIR: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
 
@@ -294,36 +337,40 @@ jobs:
           ARTIFACT_DIR="$RUNNER_TEMP/android-apk-artifacts"
 
           if [[ ! -d "$APK_SOURCE_DIR" ]]; then
-            echo "::error::Không tìm thấy thư mục APK đầu ra: $APK_SOURCE_DIR"
+            echo "::error::APK output directory not found."
             exit 1
           fi
 
-          mapfile -d '' apk_files < <(
-            find "$APK_SOURCE_DIR" -type f -name '*.apk' -print0
+          mapfile -d '' APK_FILES < <(
+            find "$APK_SOURCE_DIR" \
+              -type f -name '*.apk' -print0
           )
 
-          if (( ${#apk_files[@]} == 0 )); then
-            echo "::error::Gradle kết thúc nhưng không tìm thấy file APK."
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo "::error::No APK files generated."
             exit 1
           fi
 
           rm -rf "$ARTIFACT_DIR"
           mkdir -p "$ARTIFACT_DIR"
 
-          for apk in "${apk_files[@]}"; do
-            relative_path="${apk#"$APK_SOURCE_DIR"/}"
-            destination="$ARTIFACT_DIR/$relative_path"
+          for APK in "${APK_FILES[@]}"; do
 
-            mkdir -p "$(dirname "$destination")"
-            cp "$apk" "$destination"
+            RELATIVE_PATH="${APK#"$APK_SOURCE_DIR"/}"
+            DESTINATION="$ARTIFACT_DIR/$RELATIVE_PATH"
 
-            echo "APK: $destination"
-            ls -lh "$destination"
+            mkdir -p "$(dirname "$DESTINATION")"
+
+            cp "$APK" "$DESTINATION"
+
+            echo "Generated APK:"
+            ls -lh "$DESTINATION"
+
           done
 
-          echo "Đã xác minh ${#apk_files[@]} file APK."
+          echo "Total APK files: ${#APK_FILES[@]}"
 
-      - name: 11. Upload APK artifact
+      - name: 10. Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: 89-fitness-yoga-v3-debug-apk
