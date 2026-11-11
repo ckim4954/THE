@@ -271,19 +271,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Installing exact compile SDK package..."
-
           sdkmanager --install \
             "platforms;android-36.1"
 
-          echo "Verifying installed platform..."
-
           if [[ ! -d "$ANDROID_HOME/platforms/android-36.1" ]]; then
-            echo "::error::Android SDK Platform 36.1 installation not verified."
+            echo "::error::Android SDK Platform 36.1 installation failed."
             exit 1
           fi
 
-          echo "Android SDK Platform 36.1 is ready."
+          echo "Android SDK Platform 36.1 ready."
 
       - name: 8. Prepare Debug Keystore
         shell: bash
@@ -317,7 +313,26 @@ jobs:
 
           test -s "$KEYSTORE"
 
-      - name: 9. Build Debug APK
+      - name: 9. Prepare Secrets Gradle Plugin configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          if [[ ! -f ".env.example" ]]; then
+            echo ".env.example is missing."
+            echo "Creating an empty default properties file for the Secrets Gradle Plugin."
+            touch ".env.example"
+          else
+            echo ".env.example already exists. Preserving original file."
+          fi
+
+          test -f ".env.example"
+
+          echo "Secrets Gradle Plugin configuration is present."
+
+      - name: 10. Build Debug APK
         shell: bash
         run: |
           set -euo pipefail
@@ -329,7 +344,7 @@ jobs:
             --stacktrace \
             :app:assembleDebug
 
-      - name: 10. Verify APK
+      - name: 11. Verify APK
         shell: bash
         run: |
           set -euo pipefail
@@ -368,7 +383,7 @@ jobs:
 
           done
 
-      - name: 11. Upload APK
+      - name: 12. Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: 89-fitness-yoga-debug-apk
